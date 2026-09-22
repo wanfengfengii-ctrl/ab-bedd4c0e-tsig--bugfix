@@ -45,6 +45,10 @@ TSIG_BADTIME = 18
 ALGORITHM_NAME = "hmac-sha256."  # TSIG-style name, HMAC-SHA256 per RFC 4635
 _ALGORITHM_WIRE = b"\x0bhmac-sha256\x00"
 
+# RFC 2845 §4.4: a TSIG MUST appear at least on every 100th envelope of a
+# multi-message TCP transfer (in addition to the first and the last).
+TSIG_SIGN_INTERVAL = 100
+
 FLAG_QR = 0x8000
 FLAG_AA = 0x0400
 FLAG_TC = 0x0200
@@ -196,17 +200,22 @@ def _tsig_rdata(alg_wire: bytes, when: int, fudge: int, mac: bytes,
             + struct.pack(">HHH", orig_id, error, len(other)) + other)
 
 
+def _tsig_timers(when: int, fudge: int) -> bytes:
+    """The 48-bit Time Signed followed by the 16-bit Fudge, wire format."""
+    return struct.pack(">HIH", (when >> 32) & 0xFFFF, when & 0xFFFFFFFF,
+                       fudge)
+
+
 def tsig_variables(key_name: str, alg_wire: bytes, when: int, fudge: int,
                    error: int, other: bytes) -> bytes:
-    """The digest-variable block appended to the signed message (RFC 2845
-    §3.4.2): the TSIG RR with MAC Size and MAC omitted."""
-    rdata_no_mac = (alg_wire
-                    + struct.pack(">HIH", (when >> 32) & 0xFFFF,
-                                  when & 0xFFFFFFFF, fudge)
-                    + struct.pack(">H", error) + struct.pack(">H", len(other))
-                    + other)
+    """The digest-variable block appended to the FIRST signed message of a
+    transaction (RFC 2845 §3.4.2). It is the TSIG RR in digest form: NAME,
+    CLASS (ANY), TTL (0), then the RDATA with MAC Size and MAC omitted. The
+    RR TYPE and RDLEN fields are NOT part of the digest."""
+    rdata_no_mac = (alg_wire + _tsig_timers(when, fudge)
+                    + struct.pack(">HH", error, len(other)) + other)
     return (encode_name(key_name)
-            + struct.pack(">HHIH", TYPE_TSIG, CLASS_ANY, 0, len(rdata_no_mac))
+            + struct.pack(">HI", CLASS_ANY, 0)
             + rdata_no_mac)
 
 
@@ -333,58 +342,107 @@ def parse_query(buf: bytes) -> dict:
 # ---------------------------------------------------------------------------
 # TSIG signing / verification (HMAC-SHA256, server UTC only)
 # ---------------------------------------------------------------------------
+#
+# All MACs are computed as one continuous HMAC-SHA256 over an octet stream
+# (RFC 2845 §3.4 / §4.4). The construction, verified against the dnspython
+# reference implementation, is:
+#
+#   request MAC   = HMAC(key, message_without_TSIG(ARCOUNT decremented)
+#                              || TSIG variables)
+#   first reply   = HMAC(key, u16(len(request MAC)) || request MAC
+#                              || reply_without_TSIG(ARCOUNT decremented)
+#                              || TSIG variables)
+#   later signed  = HMAC(key, running context fed with, in order:
+#                              u16(len(prev MAC)) || prev MAC once at reset,
+#                              every unsigned intermediary message (raw wire),
+#                              this message without TSIG (ARCOUNT decremented),
+#                              TSIG timers (time || fudge) only)
+#
+# Only the running MAC that begins a fresh HMAC context is length prefixed
+# (§3.4.3); the unsigned intermediary messages are fed raw, with no prefix.
 
-def _digest_block(msg: bytes, tsig_offset: int, final_arcount: int,
-                  key_name: str, when: int, fudge: int, error: int,
-                  other: bytes) -> bytes:
-    # RFC 2845 §3.4.2: the signed base is the message *before* the TSIG RR,
-    # with ARCOUNT adjusted to the value it has after the TSIG is appended.
-    base = msg[:tsig_offset]
-    base = patch_arcount(base, final_arcount)
-    return base + tsig_variables(key_name, _ALGORITHM_WIRE, when, fudge, error,
-                                 other)
+
+def _message_without_tsig(raw: bytes, tsig_offset: int,
+                          arcount_with_tsig: int) -> bytes:
+    """The wire message with the TSIG RR removed and ARCOUNT decremented
+    (RFC 2845 §3.2 / §3.4.1)."""
+    base = raw[:tsig_offset]
+    return patch_arcount(base, arcount_with_tsig - 1)
 
 
 def expected_request_mac(key: bytes, q: dict) -> bytes:
     t = q["tsig"]
-    block = _digest_block(q["raw"], q["tsig_offset"], q["arcount"], t["name"],
-                          t["time"], t["fudge"], t["error"], t["other"])
+    block = (_message_without_tsig(q["raw"], q["tsig_offset"], q["arcount"])
+             + tsig_variables(t["name"], _ALGORITHM_WIRE, t["time"],
+                              t["fudge"], t["error"], t["other"]))
     return hmac.new(key, block, hashlib.sha256).digest()
 
 
-def prior_mac_wire(prior_mac: bytes) -> bytes:
-    """RFC 2845 §4.4: whenever a prior digest enters a subsequent MAC it is
-    prefixed with its 16-bit length ("MAC size || MAC"). This applies to the
-    request MAC feeding the first response MAC, the previous response MAC
-    feeding the next signed one, and every unsigned intermediary message."""
-    return struct.pack(">H", len(prior_mac)) + prior_mac
+def _new_running_context(key: bytes, prior_mac: bytes):
+    """Start the HMAC context for a signed envelope, seeded with the prior
+    digest in §3.4.3 wire form (MAC size || MAC)."""
+    ctx = hmac.new(key, b"", hashlib.sha256)
+    ctx.update(struct.pack(">H", len(prior_mac)) + prior_mac)
+    return ctx
 
 
-def continue_running_mac(key: bytes, running_mac: bytes,
-                         unsigned_message: bytes) -> bytes:
-    """Fold one unsigned intermediary transfer message into the continuous
-    authentication state (RFC 2845 §4.4 / RFC 8945 §5.3.2): the new running
-    MAC is HMAC over ``len16(running) || running || message``. The plain wire
-    message is fed exactly as sent, including its real (zero) ARCOUNT."""
-    block = prior_mac_wire(running_mac) + unsigned_message
-    return hmac.new(key, block, hashlib.sha256).digest()
+class RunningMac:
+    """Continuous TSIG authentication state for one multi-message transfer
+    (RFC 2845 §4.4).
+
+    Every envelope -- signed or unsigned -- advances the same state. A signed
+    envelope resets the underlying HMAC context with ``size || its MAC``;
+    unsigned envelopes are fed in verbatim. Therefore changing any byte of an
+    unsigned intermediary changes every later signature."""
+
+    def __init__(self, key: bytes, prior_mac: bytes):
+        self.key = key
+        self.ctx = _new_running_context(key, prior_mac)
+        self.last_mac = prior_mac
+
+    def feed_unsigned(self, message: bytes) -> None:
+        """Fold one unsigned intermediary message (raw wire, exactly as sent)
+        into the running state."""
+        self.ctx.update(message)
+
+    def sign(self, message_without_tsig: bytes, key_name: str, when: int,
+             fudge: int, orig_id: int, first: bool, error: int = 0,
+             other: bytes = b"") -> tuple[bytes, bytes]:
+        """Produce the MAC for the next signed envelope and append its TSIG.
+
+        ``first`` selects the standard-answer digest (full TSIG variables,
+        §4.2); later envelopes append the timers only (§4.4)."""
+        self.ctx.update(message_without_tsig)
+        if first:
+            self.ctx.update(tsig_variables(key_name, _ALGORITHM_WIRE, when,
+                                           fudge, error, other))
+        else:
+            self.ctx.update(_tsig_timers(when, fudge))
+        mac = self.ctx.digest()
+        signed = append_tsig(message_without_tsig, key_name, when, fudge, mac,
+                             orig_id, error=error, arcount_before=0,
+                             other=other)
+        # Reset for the following segment of the stream.
+        self.ctx = _new_running_context(self.key, mac)
+        self.last_mac = mac
+        return signed, mac
 
 
 def sign_response(key: bytes, response_no_tsig: bytes, key_name: str,
                   prior_mac: bytes, when: int, fudge: int, orig_id: int,
-                  arcount_before: int, error: int = 0,
+                  arcount_before: int = 0, error: int = 0,
                   other: bytes = b"") -> tuple[bytes, bytes]:
-    """Sign and append TSIG. Returns (wire, mac).
+    """Sign a *single* standard answer (RFC 2845 §4.2): request/prior MAC
+    (size-prefixed) || message without TSIG (ARCOUNT pre-increment) || full
+    TSIG variables. Returns (wire, mac).
 
-    ``prior_mac`` is the request MAC for the first signed response, or the
-    current running MAC afterwards (which already incorporates every message,
-    signed or unsigned, that preceded this one). It is always fed with the
-    RFC 2845 §4.4 two-octet length prefix."""
-    base = patch_arcount(response_no_tsig, arcount_before + 1)
-    block = (prior_mac_wire(prior_mac) + base
-             + tsig_variables(key_name, _ALGORITHM_WIRE, when, fudge, error,
+    Multi-message transfers must use :class:`RunningMac` instead so unsigned
+    intermediary messages stay inside the continuous authentication state."""
+    ctx = _new_running_context(key, prior_mac)
+    ctx.update(response_no_tsig)
+    ctx.update(tsig_variables(key_name, _ALGORITHM_WIRE, when, fudge, error,
                               other))
-    mac = hmac.new(key, block, hashlib.sha256).digest()
+    mac = ctx.digest()
     return append_tsig(response_no_tsig, key_name, when, fudge, mac, orig_id,
                        error=error, arcount_before=arcount_before,
                        other=other), mac

@@ -175,10 +175,10 @@ class TestEndToEnd(unittest.TestCase):
         q2, msgs2 = self._transfer(kn, sec, w.TYPE_AXFR)
         self.assertEqual(msgs1, msgs2)  # deterministic ordering
         parsed = [dc.parse_message(m) for m in msgs1]
-        prior = w.parse_query(q1)["tsig"]["mac"]
-        for i, m in enumerate(parsed):
-            if i in (0, len(parsed) - 1):
-                prior = dc.verify_response_mac(m, sec, prior, kn)
+        verifier = dc.TransferVerifier(sec, kn,
+                                      w.parse_query(q1)["tsig"]["mac"])
+        for m in parsed:
+            verifier.observe(m)
         answers = [a for m in msgs1 for a in dc.parse_message(m)["answers"]]
         self.assertEqual(answers[0]["type"], w.TYPE_SOA)
         self.assertEqual(answers[-1]["type"], w.TYPE_SOA)
@@ -211,12 +211,65 @@ class TestEndToEnd(unittest.TestCase):
                 else:
                     self.assertIsNone(m["tsig"], f"middle msg {i} must be unsigned")
             prior = w.parse_query(q)["tsig"]["mac"]
-            for i, m in enumerate(parsed):
-                if i in (0, len(parsed) - 1):
-                    prior = dc.verify_response_mac(m, sec, prior, kn)
+            verifier = dc.TransferVerifier(sec, kn, prior)
+            for m in parsed:
+                verifier.observe(m)
             answers = [a for m in msgs for a in dc.parse_message(m)["answers"]]
             self.assertEqual(dc.soa_serial(answers[0]["rdata"]), 2)
             self.assertEqual(dc.soa_serial(answers[-1]["rdata"]), 2)
+        finally:
+            Config.XFER_MESSAGE_BUDGET = old_budget
+
+    def test_03c_long_axfr_has_periodic_tsig_and_continuous_chain(self):
+        # RFC 2845 §4.4: beyond 100 envelopes the server must place a periodic
+        # TSIG, and every unsigned intermediary is part of the continuous
+        # running MAC. A budget below the TSIG reservation packs one RR per
+        # message, so ~108 RRs yield ~108 messages (signed at 0, 100, last).
+        old_budget = Config.XFER_MESSAGE_BUDGET
+        Config.XFER_MESSAGE_BUDGET = 300
+        try:
+            self._create_zone(1)
+            n_a = 105
+            ops = soa_ops(2) + [
+                a_op(f"h{i:03d}", f"192.0.3.{i & 255}") for i in range(n_a)]
+            http("POST", f"/v1/zones/{self.zone}/publish",
+                 {"requestId": "r", "baseSerial": 1, "nextSerial": 2,
+                  "changes": ops}, want=201)
+            kn, sec = self._install_key()
+            q, msgs = self._transfer(kn, sec, w.TYPE_AXFR)
+            n = len(msgs)
+            self.assertGreater(n, 101, f"expected >101 messages, got {n}")
+            parsed = [dc.parse_message(m) for m in msgs]
+            signed = [i for i, m in enumerate(parsed) if m["tsig"] is not None]
+            # First, last and the 100th envelope at minimum.
+            self.assertEqual(signed[0], 0)
+            self.assertEqual(signed[-1], n - 1)
+            self.assertIn(w.TSIG_SIGN_INTERVAL, signed)
+            # No gap between signatures may exceed the standard interval.
+            gaps = [b - a for a, b in zip(signed, signed[1:])]
+            self.assertTrue(all(g <= w.TSIG_SIGN_INTERVAL for g in gaps),
+                            f"signature gap exceeds 100: {gaps}")
+            # Exactly the rule-derived set (first, last, every 100th).
+            expect_signed = {i for i in range(n)
+                             if i == 0 or i == n - 1
+                             or i % w.TSIG_SIGN_INTERVAL == 0}
+            self.assertEqual(set(signed), expect_signed)
+            # The whole stream verifies through one continuous authentication
+            # state (unsigned middles folded in, periodic MACs timers-only).
+            verifier = dc.TransferVerifier(
+                sec, kn, w.parse_query(q)["tsig"]["mac"])
+            for m in parsed:
+                verifier.observe(m)
+            # Altering one byte of an unsigned middle must invalidate a later
+            # signature (simulate a modified wire before verification).
+            mid = next(i for i in range(n) if parsed[i]["tsig"] is None)
+            bad = [m for m in msgs]
+            tampered = bytearray(bad[mid]); tampered[-1] ^= 0xFF
+            bad[mid] = bytes(tampered)
+            v2 = dc.TransferVerifier(sec, kn, w.parse_query(q)["tsig"]["mac"])
+            with self.assertRaises(AssertionError):
+                for m in bad:
+                    v2.observe(dc.parse_message(m))
         finally:
             Config.XFER_MESSAGE_BUDGET = old_budget
 
@@ -447,12 +500,13 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(dc.soa_serial(answers[-1]["rdata"]), 2)
         self.assertEqual(sum(1 for r in answers if r["type"] == w.TYPE_A),
                          n_records)
-        # TSIG chain on first/last still verifies with the (now revoked) key
+        # TSIG chain over the whole stream (first/last + periodic) verifies
+        # with the (now revoked) key
         parsed = [dc.parse_message(f) for f in frames]
-        prior = w.parse_query(q)["tsig"]["mac"]
-        for i, m in enumerate(parsed):
-            if i in (0, len(parsed) - 1):
-                prior = dc.verify_response_mac(m, sec, prior, kn)
+        verifier = dc.TransferVerifier(sec, kn,
+                                      w.parse_query(q)["tsig"]["mac"])
+        for m in parsed:
+            verifier.observe(m)
 
         # new connections observe the new state: revoked key refused,
         # new key serves serial 3

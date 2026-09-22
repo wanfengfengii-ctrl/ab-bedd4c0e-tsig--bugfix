@@ -455,31 +455,28 @@ class TCPHandler(socketserver.BaseRequestHandler):
             logic.db.release_transfer(ref_id)
 
     def _stream_signed_transfer(self, logic, plan, q, msg_iter) -> None:
-        """Send messages as they are produced, signing only the first and the
-        last (RFC 2845) with the running-MAC chain. A one-message lookahead
-        identifies the final message without buffering the whole transfer."""
+        """Send messages as they are produced with a continuous RFC 2845 §4.4
+        authentication state: the first envelope, the last and at least every
+        100th envelope carry a TSIG. Every unsigned intermediary is folded into
+        the same running MAC, so altering any byte of it changes every later
+        signature. A one-message lookahead identifies the final message
+        without buffering the whole transfer."""
         when = utcnow()
         key, key_name = plan["secret"], plan["keyName"]
-        request_mac = q["tsig"]["mac"]
-        first_signed_mac = None
+        running = dnswire.RunningMac(key, q["tsig"]["mac"])
         index = 0
 
-        def send_indexed(i: int, plain: bytes, is_last: bool):
-            nonlocal first_signed_mac
-            if i == 0 or is_last:
-                # First signs chaining from request MAC; last chains from the
-                # first response MAC. When first==last, request MAC is used.
-                if i == 0:
-                    prior = request_mac
-                else:
-                    prior = first_signed_mac
-                signed, mac = dnswire.sign_response(
-                    key, plain, key_name, prior, when, 300, q["id"],
-                    arcount_before=0)
-                if i == 0:
-                    first_signed_mac = mac
-                out = signed
+        def send_one(i: int, plain: bytes, is_last: bool):
+            should_sign = (
+                i == 0 or is_last
+                or i % dnswire.TSIG_SIGN_INTERVAL == 0)
+            if should_sign:
+                # First envelope uses the standard-answer digest (full TSIG
+                # variables); later signed envelopes append timers only.
+                out, _mac = running.sign(plain, key_name, when, 300, q["id"],
+                                         first=(i == 0))
             else:
+                running.feed_unsigned(plain)
                 out = plain
             self.request.sendall(_frame(out))
             try:
@@ -490,11 +487,11 @@ class TCPHandler(socketserver.BaseRequestHandler):
         pending = None
         for plain in msg_iter:
             if pending is not None:
-                send_indexed(index, pending, False)
+                send_one(index, pending, False)
                 index += 1
             pending = plain
         # pending is the final message (transfers always yield >=1 message)
-        send_indexed(index, pending, True)
+        send_one(index, pending, True)
 
 
 def build_dns_servers(db: Database, ready: dict) -> tuple[_ThreadedUDP,
