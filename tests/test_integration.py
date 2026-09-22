@@ -1,6 +1,8 @@
 """End-to-end test on real loopback sockets: HTTP API + UDP/TCP DNS + TSIG
 AXFR/IXFR, run in-process against a temp database (no Docker required)."""
 import base64
+import hashlib
+import hmac
 import json
 import os
 import socket
@@ -65,6 +67,18 @@ def _recvn(sock, n):
             break
         buf += chunk
     return buf
+
+
+def verify_chain(parsed, secret, key_name, request_mac):
+    """Walk the continuous RFC 2845 §4.4 chain: verify every signed message
+    against the running MAC and fold every unsigned message into it."""
+    prior = request_mac
+    for m in parsed:
+        if m["tsig"] is not None:
+            prior = dc.verify_response_mac(m, secret, prior, key_name)
+        else:
+            prior = dc.continue_running_mac(secret, prior, m["raw"])
+    return prior
 
 
 class TestEndToEnd(unittest.TestCase):
@@ -176,9 +190,7 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(msgs1, msgs2)  # deterministic ordering
         parsed = [dc.parse_message(m) for m in msgs1]
         prior = w.parse_query(q1)["tsig"]["mac"]
-        for i, m in enumerate(parsed):
-            if i in (0, len(parsed) - 1):
-                prior = dc.verify_response_mac(m, sec, prior, kn)
+        verify_chain(parsed, sec, kn, prior)
         answers = [a for m in msgs1 for a in dc.parse_message(m)["answers"]]
         self.assertEqual(answers[0]["type"], w.TYPE_SOA)
         self.assertEqual(answers[-1]["type"], w.TYPE_SOA)
@@ -211,14 +223,78 @@ class TestEndToEnd(unittest.TestCase):
                 else:
                     self.assertIsNone(m["tsig"], f"middle msg {i} must be unsigned")
             prior = w.parse_query(q)["tsig"]["mac"]
-            for i, m in enumerate(parsed):
-                if i in (0, len(parsed) - 1):
-                    prior = dc.verify_response_mac(m, sec, prior, kn)
+            verify_chain(parsed, sec, kn, prior)
             answers = [a for m in msgs for a in dc.parse_message(m)["answers"]]
             self.assertEqual(dc.soa_serial(answers[0]["rdata"]), 2)
             self.assertEqual(dc.soa_serial(answers[-1]["rdata"]), 2)
         finally:
             Config.XFER_MESSAGE_BUDGET = old_budget
+
+    def test_03c_long_transfer_periodic_signing(self):
+        # RFC 2845 §4.4 / RFC 8945 §5.3.2 over a >100-message transfer: the
+        # first, the last and at least every 100th message carry a TSIG, and
+        # the whole continuous chain verifies.
+        old_budget = Config.XFER_MESSAGE_BUDGET
+        Config.XFER_MESSAGE_BUDGET = 300  # one RR per message
+        try:
+            self._create_zone(1)
+            ops = soa_ops(2) + [
+                a_op(f"h{i:03d}", f"192.0.{i >> 8}.{i & 255}")
+                for i in range(105)]
+            http("POST", f"/v1/zones/{self.zone}/publish",
+                 {"requestId": "r", "baseSerial": 1, "nextSerial": 2,
+                  "changes": ops}, want=201)
+            kn, sec = self._install_key()
+            q, msgs = self._transfer(kn, sec, w.TYPE_AXFR)
+            self.assertGreater(len(msgs), 102,
+                               "expected a >102-message transfer")
+            parsed = [dc.parse_message(m) for m in msgs]
+            signed = [i for i, m in enumerate(parsed)
+                      if m["tsig"] is not None]
+            expect = list(range(0, len(parsed), w.TSIG_SIGN_INTERVAL))
+            if expect[-1] != len(parsed) - 1:
+                expect.append(len(parsed) - 1)
+            self.assertEqual(signed, expect)
+            # never more than 99 consecutive unsigned messages
+            for a, b in zip(signed, signed[1:]):
+                self.assertLessEqual(b - a, w.TSIG_SIGN_INTERVAL)
+            prior = w.parse_query(q)["tsig"]["mac"]
+            verify_chain(parsed, sec, kn, prior)
+        finally:
+            Config.XFER_MESSAGE_BUDGET = old_budget
+
+    def test_03d_standard_signed_request_accepted(self):
+        # Interop: a request signed by an independent RFC 2845 §4.2
+        # implementation (TSIG stripped from the MAC input, ARCOUNT=0) must
+        # authenticate — the server computes the same request MAC.
+        self._create_zone(1)
+        kn, sec = self._install_key()
+        qid = 0x3333
+        when = int(time.time())
+        question = (w.encode_name(self.zone)
+                    + struct.pack(">HH", w.TYPE_AXFR, w.CLASS_IN))
+        mac_input = (struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+                     + question
+                     + w.tsig_variables(kn, w._ALGORITHM_WIRE, when, 300,
+                                        0, b""))
+        mac = hmac.new(sec, mac_input, hashlib.sha256).digest()
+        rdata = (w._ALGORITHM_WIRE
+                 + struct.pack(">HIH", (when >> 32) & 0xFFFF,
+                               when & 0xFFFFFFFF, 300)
+                 + struct.pack(">H", len(mac)) + mac
+                 + struct.pack(">HHH", qid, 0, 0))
+        tsig_rr = (w.encode_name(kn)
+                   + struct.pack(">HHIH", w.TYPE_TSIG, w.CLASS_ANY, 0,
+                                 len(rdata)) + rdata)
+        query = (struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 1)
+                 + question + tsig_rr)
+        msgs = dc.tcp_transfer(HOST, DNS_P, query)
+        self.assertTrue(msgs, "standard-signed request was rejected")
+        parsed = [dc.parse_message(m) for m in msgs]
+        self.assertEqual(parsed[0]["rcode"], 0)
+        self.assertIsNotNone(parsed[0]["tsig"])
+        self.assertIsNotNone(parsed[-1]["tsig"])
+        verify_chain(parsed, sec, kn, mac)
 
     def test_04_ixfr_chain_and_equality(self):
         self._create_zone(1)
@@ -450,9 +526,7 @@ class TestEndToEnd(unittest.TestCase):
         # TSIG chain on first/last still verifies with the (now revoked) key
         parsed = [dc.parse_message(f) for f in frames]
         prior = w.parse_query(q)["tsig"]["mac"]
-        for i, m in enumerate(parsed):
-            if i in (0, len(parsed) - 1):
-                prior = dc.verify_response_mac(m, sec, prior, kn)
+        verify_chain(parsed, sec, kn, prior)
 
         # new connections observe the new state: revoked key refused,
         # new key serves serial 3

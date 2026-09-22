@@ -174,22 +174,31 @@ def axfr(zone: str, key_name: str, secret: bytes, host: str | None = None,
     return q, msgs
 
 
-def verify_tsig_chain(msgs: bytes and list, key_name: str, secret: bytes,
+def verify_tsig_chain(msgs: list, key_name: str, secret: bytes,
                       request_mac: bytes) -> None:
+    """Validate the continuous RFC 2845 §4.4 chain of a transfer: first and
+    last messages signed, never more than 99 consecutive unsigned messages,
+    every signed message verifying against the running MAC that folds in all
+    preceding unsigned messages."""
     parsed = [dc.parse_message(m) for m in msgs]
     check("transfer has >=1 message", len(parsed) >= 1)
-    signed_idx = {0, len(parsed) - 1}
+    check("first message signed", parsed[0]["tsig"] is not None)
+    check("last message signed", parsed[-1]["tsig"] is not None)
     prior = request_mac
+    unsigned_run = 0
     for i, m in enumerate(parsed):
-        if i in signed_idx:
+        if m["tsig"] is not None:
             try:
                 prior = dc.verify_response_mac(m, secret, prior, key_name)
                 ok = True
             except Exception as e:
                 ok = False
-            check(f"message {i} TSIG valid (first/last signed)", ok)
+            check(f"message {i} TSIG valid (continuous chain)", ok)
+            unsigned_run = 0
         else:
-            check(f"middle message {i} unsigned", m["tsig"] is None)
+            prior = dc.continue_running_mac(secret, prior, m["raw"])
+            unsigned_run += 1
+            check(f"message {i} unsigned, run within 99", unsigned_run <= 99)
 
 
 def all_answers(msgs):

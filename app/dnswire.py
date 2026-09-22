@@ -10,6 +10,7 @@ import hmac
 import hashlib
 import struct
 import time
+from typing import Iterator
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -334,21 +335,23 @@ def parse_query(buf: bytes) -> dict:
 # TSIG signing / verification (HMAC-SHA256, server UTC only)
 # ---------------------------------------------------------------------------
 
-def _digest_block(msg: bytes, tsig_offset: int, final_arcount: int,
+def _digest_block(msg: bytes, tsig_offset: int, arcount_no_tsig: int,
                   key_name: str, when: int, fudge: int, error: int,
                   other: bytes) -> bytes:
-    # RFC 2845 §3.4.2: the signed base is the message *before* the TSIG RR,
-    # with ARCOUNT adjusted to the value it has after the TSIG is appended.
+    # RFC 2845 §4.2: the signed base is the message *before* the TSIG RR,
+    # with ARCOUNT set to the value it had before the TSIG was appended
+    # (the wire ARCOUNT decremented by one: 0 for a bare signed request).
     base = msg[:tsig_offset]
-    base = patch_arcount(base, final_arcount)
+    base = patch_arcount(base, arcount_no_tsig)
     return base + tsig_variables(key_name, _ALGORITHM_WIRE, when, fudge, error,
                                  other)
 
 
 def expected_request_mac(key: bytes, q: dict) -> bytes:
     t = q["tsig"]
-    block = _digest_block(q["raw"], q["tsig_offset"], q["arcount"], t["name"],
-                          t["time"], t["fudge"], t["error"], t["other"])
+    block = _digest_block(q["raw"], q["tsig_offset"], q["arcount"] - 1,
+                          t["name"], t["time"], t["fudge"], t["error"],
+                          t["other"])
     return hmac.new(key, block, hashlib.sha256).digest()
 
 
@@ -379,8 +382,9 @@ def sign_response(key: bytes, response_no_tsig: bytes, key_name: str,
     ``prior_mac`` is the request MAC for the first signed response, or the
     current running MAC afterwards (which already incorporates every message,
     signed or unsigned, that preceded this one). It is always fed with the
-    RFC 2845 §4.4 two-octet length prefix."""
-    base = patch_arcount(response_no_tsig, arcount_before + 1)
+    RFC 2845 §4.4 two-octet length prefix. The message enters the digest as
+    it was before the TSIG was appended, i.e. with ARCOUNT=arcount_before."""
+    base = patch_arcount(response_no_tsig, arcount_before)
     block = (prior_mac_wire(prior_mac) + base
              + tsig_variables(key_name, _ALGORITHM_WIRE, when, fudge, error,
                               other))
@@ -388,6 +392,52 @@ def sign_response(key: bytes, response_no_tsig: bytes, key_name: str,
     return append_tsig(response_no_tsig, key_name, when, fudge, mac, orig_id,
                        error=error, arcount_before=arcount_before,
                        other=other), mac
+
+
+# RFC 2845 §4.4 / RFC 8945 §5.3.2: in a multi-message TCP exchange the first
+# and last messages MUST be signed and at least every 100th message MUST be
+# signed (never more than 99 consecutive unsigned messages).
+TSIG_SIGN_INTERVAL = 100
+
+
+def sign_transfer_stream(key: bytes, key_name: str, request_mac: bytes,
+                         when: int, fudge: int, orig_id: int,
+                         messages) -> Iterator[tuple[bytes, bytes]]:
+    """Sign a transfer message stream as one continuous RFC 2845 §4.4 chain.
+
+    Yields ``(wire, running_mac)`` for each plain input message, consuming
+    *messages* lazily (one-message lookahead to mark the final message, so
+    the stream is never buffered). The first, the last and every
+    ``TSIG_SIGN_INTERVAL``-th message carry a TSIG; every unsigned message
+    is folded into the running MAC via ``continue_running_mac`` so changing
+    any byte of it changes the next signature. ``running_mac`` is the
+    authentication state after that message.
+    """
+    running = request_mac
+    index = 0
+    pending = None
+    for plain in messages:
+        if pending is not None:
+            wire, running = _chain_message(key, key_name, running, when,
+                                           fudge, orig_id, index, pending,
+                                           is_last=False)
+            yield wire, running
+            index += 1
+        pending = plain
+    if pending is None:
+        return  # empty stream (transfers always yield >= 1 message)
+    wire, running = _chain_message(key, key_name, running, when, fudge,
+                                   orig_id, index, pending, is_last=True)
+    yield wire, running
+
+
+def _chain_message(key: bytes, key_name: str, running: bytes, when: int,
+                   fudge: int, orig_id: int, index: int, plain: bytes,
+                   is_last: bool) -> tuple[bytes, bytes]:
+    if index == 0 or is_last or index % TSIG_SIGN_INTERVAL == 0:
+        return sign_response(key, plain, key_name, running, when, fudge,
+                             orig_id, arcount_before=0)
+    return plain, continue_running_mac(key, running, plain)
 
 
 def verify_tsig_time(tsig_time: int, fudge: int, now: int, max_fudge: int = 300

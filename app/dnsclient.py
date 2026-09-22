@@ -40,7 +40,9 @@ def build_tsig_query(qid: int, qname: str, qtype: int, key_name: str,
     base = struct.pack(">HHHHHH", qid, flags, 1, 0, 1 if authority else 0,
                        arcount)
     base += question_wire(qname, qtype) + authority
-    block = (w.patch_arcount(base, arcount)
+    # RFC 2845 §4.2: the MAC input is the message as it was before the TSIG
+    # RR was appended, i.e. with ARCOUNT still excluding the TSIG (0 here).
+    block = (w.patch_arcount(base, arcount - 1)
              + w.tsig_variables(key_name, ALG, when, fudge, 0, b""))
     mac = hmac.new(secret, block, hashlib.sha256).digest()
     rdata = (ALG
@@ -125,10 +127,10 @@ def _skip_to_section_end(buf, start, qd, an, ns):
 
 
 def _signed_base(msg: dict) -> bytes:
-    """RFC 2845 §3.4.2: message bytes before the TSIG RR with ARCOUNT set to
-    the post-TSIG value."""
+    """RFC 2845 §4.2/§4.3: message bytes before the TSIG RR with ARCOUNT set
+    to the pre-TSIG value (the wire ARCOUNT decremented by one)."""
     base = msg["raw"][:msg["tsig_offset"]]
-    return w.patch_arcount(base, msg["arcount"])
+    return w.patch_arcount(base, msg["arcount"] - 1)
 
 
 def continue_running_mac(secret: bytes, running_mac: bytes,
@@ -156,13 +158,14 @@ def verify_response_mac(msg: dict, secret: bytes, prior_mac: bytes,
 def reference_request_mac(qname: str, qtype: int, qclass: int, flags: int,
                           authority: bytes, key_name: str, secret: bytes,
                           when: int, fudge: int, qid: int) -> bytes:
-    """Independently compute the standard request MAC (RFC 2845 §3.4.2) from
-    scratch, without sharing the server/client message builders."""
+    """Independently compute the standard request MAC (RFC 2845 §4.2) from
+    scratch, without sharing the server/client message builders. The MAC
+    input is the message before the TSIG is appended: ARCOUNT=0."""
     question = w.encode_name(qname) + struct.pack(">HH", qtype, qclass)
     nscount = 1 if authority else 0
     base = struct.pack(">HHHHHH", qid, flags, 1, 0, nscount, 1)
     base += question + authority
-    block = (w.patch_arcount(base, 1)
+    block = (w.patch_arcount(base, 0)
              + w.tsig_variables(key_name, ALG, when, fudge, 0, b""))
     return hmac.new(secret, block, hashlib.sha256).digest()
 

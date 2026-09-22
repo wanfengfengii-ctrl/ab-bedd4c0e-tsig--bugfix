@@ -455,46 +455,20 @@ class TCPHandler(socketserver.BaseRequestHandler):
             logic.db.release_transfer(ref_id)
 
     def _stream_signed_transfer(self, logic, plan, q, msg_iter) -> None:
-        """Send messages as they are produced, signing only the first and the
-        last (RFC 2845) with the running-MAC chain. A one-message lookahead
-        identifies the final message without buffering the whole transfer."""
-        when = utcnow()
-        key, key_name = plan["secret"], plan["keyName"]
-        request_mac = q["tsig"]["mac"]
-        first_signed_mac = None
-        index = 0
-
-        def send_indexed(i: int, plain: bytes, is_last: bool):
-            nonlocal first_signed_mac
-            if i == 0 or is_last:
-                # First signs chaining from request MAC; last chains from the
-                # first response MAC. When first==last, request MAC is used.
-                if i == 0:
-                    prior = request_mac
-                else:
-                    prior = first_signed_mac
-                signed, mac = dnswire.sign_response(
-                    key, plain, key_name, prior, when, 300, q["id"],
-                    arcount_before=0)
-                if i == 0:
-                    first_signed_mac = mac
-                out = signed
-            else:
-                out = plain
-            self.request.sendall(_frame(out))
+        """Send messages as they are produced under one continuous RFC 2845
+        §4.4 authentication chain: the first, the last and at least every
+        100th message carry a TSIG, and every unsigned intermediary message
+        advances the running MAC so its content is covered by the next
+        signature. Only a one-message lookahead is held, never the whole
+        transfer."""
+        for wire, _mac in dnswire.sign_transfer_stream(
+                plan["secret"], plan["keyName"], q["tsig"]["mac"], utcnow(),
+                300, q["id"], msg_iter):
+            self.request.sendall(_frame(wire))
             try:
                 logic.db.heartbeat_transfer(plan["refId"])
             except Exception:
                 pass
-
-        pending = None
-        for plain in msg_iter:
-            if pending is not None:
-                send_indexed(index, pending, False)
-                index += 1
-            pending = plain
-        # pending is the final message (transfers always yield >=1 message)
-        send_indexed(index, pending, True)
 
 
 def build_dns_servers(db: Database, ready: dict) -> tuple[_ThreadedUDP,
